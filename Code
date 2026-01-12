@@ -1,0 +1,161 @@
+#include <Wire.h>
+#include <I2Cdev.h>
+#include <MPU6050.h>
+#include <SoftwareSerial.h>
+#include <TinyGPS++.h>
+
+// --- SIM800L ---
+SoftwareSerial sim(10, 11); // SIM800L RX, TX
+int _timeout;
+String _buffer;
+String number = "";  // <-- Your phone number with +91 (for India)
+
+// --- Sensors ---
+const int mq3Pin = A0;       // MQ-3 alcohol sensor (analog)
+const int buzzerPin = 13;    // Buzzer
+const int irPin = 12;        // IR helmet sensor (digital)
+const int relayPin = 4;      // Relay controlling motor
+const int threshold = 600;   // Alcohol detection threshold (0-1023)
+
+// GPS module pins (connect GPS TX -> pin 5, GPS RX -> pin 6)
+static const int RXPin = 5, TXPin = 6;
+static const uint32_t GPSBaud = 9600;
+TinyGPSPlus gps;
+SoftwareSerial gpsSerial(RXPin, TXPin);
+
+// --- Accelerometer MPU6050 ---
+MPU6050 mpu;
+int16_t ax, ay, az, gx, gy, gz;
+float accX, accY, accZ, accMag;
+
+void setup() {
+  Serial.begin(9600);
+  gpsSerial.begin(GPSBaud);
+  sim.begin(9600);
+  _buffer.reserve(50);
+  Serial.println("System Started...");
+
+  // Pins
+  pinMode(buzzerPin, OUTPUT);
+  pinMode(irPin, INPUT);
+  pinMode(relayPin, OUTPUT);
+  // analog pins do not require pinMode, but harmless if left out for mq3Pin
+  digitalWrite(buzzerPin, LOW);
+  digitalWrite(relayPin, LOW);
+
+  // MPU6050
+  Wire.begin();
+  mpu.initialize();
+  if (mpu.testConnection()) {
+    Serial.println("MPU6050 connected");
+  } else {
+    Serial.println("MPU6050 connection failed");
+  }
+}
+
+// --- Read SIM response safely ---
+String _readSerial() {
+  _timeout = 0;
+  while (!sim.available() && _timeout < 12000) {
+    delay(13);
+    _timeout++;
+  }
+  if (sim.available()) {
+    return sim.readString();
+  } else {
+    return "";  // no response
+  }
+}
+
+// --- Send SMS ---
+void SendMessage(String SMS) {
+  sim.println("AT+CMGF=1");    // Set SMS text mode
+  delay(200);
+  sim.print("AT+CMGS=\"");
+  sim.print(number);
+  sim.println("\"");
+  delay(200);
+  sim.println(SMS);
+  delay(100);
+  sim.write(26);  // CTRL+Z
+  delay(200);
+  _buffer = _readSerial();
+  Serial.println("SMS Sent: " + SMS);
+}
+
+void loop() {
+  // --- Helmet + Alcohol check ---
+  int sensorValue = analogRead(mq3Pin);
+  int irValue = digitalRead(irPin);
+
+  if (irValue == HIGH) {
+    digitalWrite(buzzerPin, HIGH);
+    digitalWrite(relayPin, HIGH);  // Motor OFF
+    Serial.println("Helmet not worn → Buzzer ON, Motor OFF");
+  } else if (sensorValue > threshold) {
+    digitalWrite(buzzerPin, HIGH);
+    digitalWrite(relayPin, HIGH);  // Motor OFF
+    Serial.println("Alcohol detected → Buzzer ON, Motor OFF");
+  } else {
+    digitalWrite(buzzerPin, LOW);
+    digitalWrite(relayPin, LOW);   // Motor ON
+    Serial.println("Helmet worn & No alcohol → Buzzer OFF, Motor ON");
+  }
+
+  // --- Fall Detection ---
+  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+  accX = ax / 16384.0;
+  accY = ay / 16384.0;
+  accZ = az / 16384.0;
+  accMag = sqrt(accX * accX + accY * accY + accZ * accZ);
+
+  Serial.print("Accel Magnitude: ");
+  Serial.println(accMag);
+
+  if (accMag > 2.5 && irValue == LOW && sensorValue < threshold) {
+    Serial.println("⚠ FALL DETECTED!");
+    digitalWrite(buzzerPin, HIGH);
+    digitalWrite(relayPin, HIGH);
+
+    // Try to read GPS for up to 5 seconds to get a fix
+    unsigned long start = millis();
+    bool gotFix = false;
+    while (millis() - start < 5000) {
+      while (gpsSerial.available()) {
+        if (gps.encode(gpsSerial.read())) {
+          if (gps.location.isValid()) {
+            gotFix = true;
+            break;
+          }
+        }
+      }
+      if (gotFix) break;
+    }
+
+    if (gotFix) {
+      Serial.print("Latitude: ");
+      Serial.println(gps.location.lat(), 6);
+      Serial.print("Longitude: ");
+      Serial.println(gps.location.lng(), 6);
+
+      String msg = "Emergency!!! The Registered user has fallen while riding. Latitude: ";
+      msg += String(gps.location.lat(), 6);
+      msg += " Longitude: ";
+      msg += String(gps.location.lng(), 6);
+      SendMessage(msg);
+    } else {
+      Serial.println("No GPS fix yet...");
+      SendMessage("Emergency!!! The Registered user has fallen while riding. GPS fix not available.");
+    }
+
+    // HALT SYSTEM after sending SMS
+    while (true) {
+      // Keep buzzer ON to signal emergency
+      digitalWrite(buzzerPin, HIGH);
+      digitalWrite(relayPin, HIGH);
+      delay(100);
+    }
+  }
+
+  delay(500);
+}
